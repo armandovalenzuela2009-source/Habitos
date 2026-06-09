@@ -5,8 +5,15 @@ import {
   Sun, Moon, Target, TrendingUp, Award, Heart, Briefcase,
   Brain, Dumbbell, BookOpen, Star, CheckCircle2, LayoutGrid, ListTodo, ArrowUpDown,
   CalendarPlus, ArrowLeft, MapPin, Clock, GraduationCap,
-  Flag, ListChecks,
+  Flag, ListChecks, Sunrise, Sunset, GripVertical,
 } from "lucide-react";
+import { createClient } from "@supabase/supabase-js";
+
+// ----------------------------- Supabase client ---------------------------
+
+const SUPABASE_URL = "https://rskvqoyylcjfujsakrrs.supabase.co";
+const SUPABASE_KEY = "sb_publishable_F_b8K9u72qIK9s8i0S5XBw_gJpmMw01";
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // ----------------------------- Constants ---------------------------------
 
@@ -45,6 +52,14 @@ const EMOJI_OPTIONS = [
   "🦷", "🧠", "💼", "💻", "📵", "🎯", "🎨", "🎸", "🌱", "☀️",
   "🌙", "🙏", "❤️", "🔥", "⭐", "🚭", "🍵", "🚶", "🚴", "😴",
 ];
+
+const ROUTINE_TIMES = [
+  { id: "manana", name: "Mañana", icon: Sunrise, color: "#f59e0b" },
+  { id: "tarde", name: "Tarde", icon: Sun, color: "#f97316" },
+  { id: "noche", name: "Noche", icon: Moon, color: "#8b5cf6" },
+  { id: "na", name: "Sin horario", icon: Clock, color: "#6b7280" },
+];
+const routineTimeOf = (id) => ROUTINE_TIMES.find((t) => t.id === id) || ROUTINE_TIMES[3];
 
 const EVENT_TYPES = [
   { id: "evento", name: "Evento", color: "#3b82f6" },
@@ -91,6 +106,8 @@ const buildInitialData = () => ({
   tasks: [],
   events: [],
   goals: [],
+  routines: [],
+  routineLogs: {},
   settings: { dark: false, onboarded: false },
 });
 
@@ -103,44 +120,58 @@ const emptyHabit = {
 
 // ----------------------------- Storage layer -----------------------------
 
-async function loadAccounts() {
+async function kvGet(key) {
   try {
-    const res = await window.storage.get(ACCOUNTS_KEY);
-    if (res && res.value) return JSON.parse(res.value);
-  } catch (e) { /* none yet */ }
-  return [];
+    const { data, error } = await supabase
+      .from("kv_store").select("value").eq("key", key).maybeSingle();
+    if (error) { console.error(error); return null; }
+    return data ? data.value : null;
+  } catch (e) { console.error(e); return null; }
+}
+async function kvSet(key, value) {
+  try {
+    const { error } = await supabase
+      .from("kv_store").upsert({ key, value }, { onConflict: "key" });
+    if (error) console.error(error);
+  } catch (e) { console.error(e); }
+}
+async function kvDelete(key) {
+  try {
+    const { error } = await supabase.from("kv_store").delete().eq("key", key);
+    if (error) console.error(error);
+  } catch (e) { console.error(e); }
+}
+
+async function loadAccounts() {
+  const v = await kvGet(ACCOUNTS_KEY);
+  return Array.isArray(v) ? v : [];
 }
 async function saveAccounts(accounts) {
-  try { await window.storage.set(ACCOUNTS_KEY, JSON.stringify(accounts)); }
-  catch (e) { console.error(e); }
+  await kvSet(ACCOUNTS_KEY, accounts);
 }
 async function loadSession() {
   try {
-    const res = await window.storage.get(SESSION_KEY);
-    if (res && res.value) return JSON.parse(res.value).activeId || null;
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (raw) return JSON.parse(raw).activeId || null;
   } catch (e) { /* none */ }
   return null;
 }
 async function saveSession(activeId) {
-  try { await window.storage.set(SESSION_KEY, JSON.stringify({ activeId })); }
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify({ activeId })); }
   catch (e) { console.error(e); }
 }
 async function loadAccountData(id) {
-  try {
-    const res = await window.storage.get(accountDataKey(id));
-    if (res && res.value) return JSON.parse(res.value);
-  } catch (e) { /* new */ }
+  const v = await kvGet(accountDataKey(id));
+  if (v) return v;
   const fresh = buildInitialData();
   await persistAccountData(id, fresh);
   return fresh;
 }
 async function persistAccountData(id, data) {
-  try { await window.storage.set(accountDataKey(id), JSON.stringify(data)); }
-  catch (e) { console.error(e); }
+  await kvSet(accountDataKey(id), data);
 }
 async function deleteAccountData(id) {
-  try { await window.storage.delete(accountDataKey(id)); }
-  catch (e) { console.error(e); }
+  await kvDelete(accountDataKey(id));
 }
 
 // ----------------------------- Logic helpers ------------------------------
@@ -2213,6 +2244,331 @@ function GoalsView({ goals, dark, onSave, onDelete }) {
   );
 }
 
+// ----------------------------- Routines ------------------------------------
+
+function RoutineModal({ open, onClose, onSave, editing, dark }) {
+  const [form, setForm] = useState(null);
+  const [stepText, setStepText] = useState("");
+
+  useEffect(() => {
+    if (!open) return;
+    setStepText("");
+    if (editing) setForm({ ...editing, steps: (editing.steps || []).map((s) => ({ ...s })) });
+    else setForm({ name: "", emoji: "🧖", timeOfDay: "manana", steps: [] });
+  }, [open, editing]);
+
+  if (!open || !form) return null;
+  const upd = (patch) => setForm((f) => ({ ...f, ...patch }));
+  const canSave = form.name.trim().length > 0;
+  const panel = dark ? "bg-gray-800 text-white" : "bg-white text-gray-900";
+  const input = dark ? "bg-gray-700 border-gray-600 text-white placeholder-gray-400" : "bg-gray-50 border-gray-200 text-gray-900 placeholder-gray-400";
+  const label = dark ? "text-gray-300" : "text-gray-600";
+
+  const addStep = () => {
+    const t = stepText.trim();
+    if (!t) return;
+    setForm((f) => ({ ...f, steps: [...f.steps, { id: "rs" + Date.now(), text: t }] }));
+    setStepText("");
+  };
+  const removeStep = (id) => setForm((f) => ({ ...f, steps: f.steps.filter((s) => s.id !== id) }));
+  const editStepText = (id, text) => setForm((f) => ({ ...f, steps: f.steps.map((s) => (s.id === id ? { ...s, text } : s)) }));
+
+  return (
+    <div className="fixed inset-0 z-[70] flex items-end sm:items-center justify-center bg-black/50 backdrop-blur-sm p-0 sm:p-4"
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className={`${panel} w-full sm:max-w-md rounded-t-3xl sm:rounded-3xl shadow-2xl flex flex-col`} style={{ maxHeight: "92vh" }}
+        onClick={(e) => e.stopPropagation()}>
+        <div className={`flex items-center justify-between p-5 border-b shrink-0 ${dark ? "border-gray-700" : "border-gray-100"}`}>
+          <h2 className="text-lg font-bold">{editing ? "Editar rutina" : "Nueva rutina"}</h2>
+          <button onClick={onClose} className={`p-2 rounded-full ${dark ? "hover:bg-gray-700" : "hover:bg-gray-100"}`}><X size={20} /></button>
+        </div>
+        <div className="p-5 space-y-4 overflow-y-auto flex-1">
+          <div className="flex items-center gap-3">
+            <div className="flex items-center justify-center rounded-2xl shrink-0 text-3xl"
+              style={{ width: 56, height: 56, background: dark ? "#374151" : "#f3f4f6" }}>
+              {form.emoji}
+            </div>
+            <div className="flex-1">
+              <label className={`text-xs font-medium ${label}`}>Nombre de la rutina</label>
+              <input value={form.name} onChange={(e) => upd({ name: e.target.value })} autoFocus
+                placeholder="Ej. Rutina matutina" maxLength={50}
+                className={`w-full mt-1 px-3 py-2.5 rounded-xl border outline-none focus:border-blue-400 ${input}`} />
+            </div>
+          </div>
+
+          <div>
+            <label className={`text-xs font-medium ${label}`}>Emoji</label>
+            <div className="grid grid-cols-10 gap-1.5 mt-2">
+              {EMOJI_OPTIONS.map((em) => (
+                <button key={em} onClick={() => upd({ emoji: em })}
+                  className={`aspect-square rounded-lg text-lg flex items-center justify-center transition ${form.emoji === em ? "ring-2 ring-blue-500" : ""} ${dark ? "bg-gray-700 hover:bg-gray-600" : "bg-gray-100 hover:bg-gray-200"}`}>
+                  {em}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <label className={`text-xs font-medium ${label}`}>Momento del día</label>
+            <div className="grid grid-cols-4 gap-2 mt-2">
+              {ROUTINE_TIMES.map((t) => {
+                const Icon = t.icon; const on = form.timeOfDay === t.id;
+                return (
+                  <button key={t.id} onClick={() => upd({ timeOfDay: t.id })}
+                    className="flex flex-col items-center gap-1 px-1 py-2.5 rounded-xl text-[11px] font-bold transition border-2"
+                    style={{
+                      background: on ? `${t.color}1a` : "transparent",
+                      borderColor: on ? t.color : (dark ? "#374151" : "#e5e7eb"),
+                      color: on ? t.color : (dark ? "#9ca3af" : "#6b7280"),
+                    }}>
+                    <Icon size={18} /> {t.name}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div>
+            <label className={`text-xs font-medium ${label}`}>Pasos</label>
+            <div className="space-y-2 mt-2">
+              {form.steps.map((s, i) => (
+                <div key={s.id} className={`flex items-center gap-2 px-2 py-1.5 rounded-xl border ${dark ? "border-gray-700 bg-gray-700/40" : "border-gray-200 bg-gray-50"}`}>
+                  <span className={`text-xs font-bold w-5 text-center shrink-0 ${dark ? "text-gray-500" : "text-gray-400"}`}>{i + 1}</span>
+                  <input value={s.text} onChange={(e) => editStepText(s.id, e.target.value)} maxLength={80}
+                    className={`flex-1 bg-transparent outline-none text-sm ${dark ? "text-white" : "text-gray-900"}`} />
+                  <button onClick={() => removeStep(s.id)} className={`p-1 rounded-lg shrink-0 ${dark ? "hover:bg-gray-600 text-gray-400" : "hover:bg-gray-200 text-gray-400"}`}><Trash2 size={14} /></button>
+                </div>
+              ))}
+            </div>
+            <div className="flex items-center gap-2 mt-2">
+              <input value={stepText} onChange={(e) => setStepText(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") addStep(); }}
+                placeholder="Añadir un paso…" maxLength={80}
+                className={`flex-1 px-3 py-2.5 rounded-xl border outline-none focus:border-blue-400 ${input}`} />
+              <button onClick={addStep}
+                className="shrink-0 flex items-center justify-center w-11 h-11 rounded-xl bg-blue-500 text-white hover:bg-blue-600 active:scale-95 transition">
+                <Plus size={20} />
+              </button>
+            </div>
+            {form.steps.length === 0 && (
+              <p className={`text-xs mt-2 ${dark ? "text-gray-500" : "text-gray-400"}`}>Una rutina necesita al menos un paso para tachar cada día.</p>
+            )}
+          </div>
+        </div>
+        <div className={`p-5 border-t shrink-0 ${dark ? "border-gray-700" : "border-gray-100"}`}>
+          <button onClick={() => canSave && onSave(form)} disabled={!canSave}
+            className={`w-full py-3 rounded-xl font-bold text-white transition ${canSave ? "bg-blue-500 hover:bg-blue-600 active:scale-95" : "bg-gray-300 cursor-not-allowed"}`}>
+            {editing ? "Guardar cambios" : "Crear rutina"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RoutineDetail({ routine, done, dark, onBack, onToggleStep, onEdit, onDelete }) {
+  const bg = dark ? "bg-gray-900" : "bg-gray-50";
+  const txt = dark ? "text-white" : "text-gray-900";
+  const sub = dark ? "text-gray-400" : "text-gray-500";
+  const card = dark ? "bg-gray-800 border-gray-700" : "bg-white border-gray-100";
+
+  const tf = routineTimeOf(routine.timeOfDay);
+  const TfIcon = tf.icon;
+  const steps = routine.steps || [];
+  const doneCount = steps.filter((s) => done.has(s.id)).length;
+  const pct = steps.length ? Math.round((doneCount / steps.length) * 100) : 0;
+  const allDone = steps.length > 0 && doneCount === steps.length;
+
+  return (
+    <div className={`${bg} min-h-screen`} style={{ fontFamily: "system-ui, -apple-system, sans-serif" }}>
+      <div className="max-w-md mx-auto min-h-screen flex flex-col">
+        <header className={`sticky top-0 z-30 ${bg} px-4 pt-5 pb-3 flex items-center gap-3`}>
+          <button onClick={onBack} className={`p-2 rounded-full ${dark ? "bg-gray-800 text-gray-200" : "bg-white text-gray-600 border border-gray-200"}`}><ArrowLeft size={20} /></button>
+          <h1 className={`text-lg font-bold truncate flex-1 ${txt}`}>Rutina</h1>
+          <button onClick={onEdit} className={`p-2 rounded-full ${dark ? "bg-gray-800 text-gray-300" : "bg-white text-gray-500 border border-gray-200"}`}><Edit3 size={16} /></button>
+          <button onClick={onDelete} className={`p-2 rounded-full ${dark ? "bg-gray-800 text-gray-300" : "bg-white text-gray-500 border border-gray-200"}`}><Trash2 size={16} /></button>
+        </header>
+
+        <main className="flex-1 px-4 pb-24 space-y-4">
+          {/* Routine hero */}
+          <div className={`relative overflow-hidden rounded-3xl p-5 border ${card}`}>
+            <span className="absolute left-0 top-0 bottom-0 w-1.5" style={{ background: tf.color }} />
+            <div className="flex items-center gap-4">
+              <div className="flex items-center justify-center rounded-2xl shrink-0 text-4xl"
+                style={{ width: 64, height: 64, background: `${tf.color}1a` }}>
+                {routine.emoji || "🧖"}
+              </div>
+              <div className="min-w-0">
+                <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full font-bold" style={{ background: `${tf.color}1a`, color: tf.color }}>
+                  <TfIcon size={11} /> {tf.name}
+                </span>
+                <p className={`text-xl font-bold mt-1 ${txt}`}>{routine.name}</p>
+              </div>
+            </div>
+
+            {steps.length > 0 && (
+              <>
+                <div className="flex items-center justify-between mt-4 mb-1">
+                  <span className={`text-xs font-medium ${sub}`}>{allDone ? "Completada hoy 🎉" : `${doneCount}/${steps.length} pasos hoy`}</span>
+                  <span className="text-xs font-bold" style={{ color: allDone ? "#10b981" : tf.color }}>{pct}%</span>
+                </div>
+                <div className={`h-2 rounded-full overflow-hidden ${dark ? "bg-gray-700" : "bg-gray-100"}`}>
+                  <div className="h-full rounded-full transition-all duration-500" style={{ width: `${pct}%`, background: allDone ? "#10b981" : tf.color }} />
+                </div>
+              </>
+            )}
+          </div>
+
+          {allDone && (
+            <div className="flex items-center gap-3 p-4 rounded-2xl" style={{ background: "#10b98115", border: "1px solid #10b98140" }}>
+              <span className="flex items-center justify-center w-9 h-9 rounded-full shrink-0" style={{ background: "#10b981" }}>
+                <Check size={20} color="#fff" strokeWidth={3} />
+              </span>
+              <p className="text-sm font-semibold" style={{ color: "#10b981" }}>¡Rutina completada por hoy! Mañana empieza de nuevo.</p>
+            </div>
+          )}
+
+          {/* Steps */}
+          <div>
+            <h3 className={`font-bold mb-2 ${txt}`}>Pasos de hoy</h3>
+            {steps.length === 0 ? (
+              <div className={`text-center py-8 ${sub}`}>
+                <ListChecks size={36} className="mx-auto mb-2 opacity-50" />
+                <p className="text-sm">Esta rutina no tiene pasos. Toca el lápiz para añadirlos.</p>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {steps.map((s, idx) => {
+                  const checked = done.has(s.id);
+                  return (
+                    <button key={s.id} onClick={() => onToggleStep(routine.id, s.id)}
+                      className={`w-full flex items-center gap-3 p-4 rounded-2xl border text-left transition active:scale-[0.99] ${card} ${checked ? "opacity-70" : ""}`}>
+                      <span className="shrink-0 rounded-full flex items-center justify-center transition"
+                        style={{ width: 28, height: 28, background: checked ? tf.color : "transparent", border: `2px solid ${checked ? tf.color : (dark ? "#4b5563" : "#d1d5db")}` }}>
+                        {checked && <Check size={16} color="#fff" strokeWidth={3} />}
+                      </span>
+                      <span className={`shrink-0 w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold ${dark ? "bg-gray-700 text-gray-300" : "bg-gray-100 text-gray-500"}`}>{idx + 1}</span>
+                      <span className={`flex-1 min-w-0 text-sm font-medium break-words ${txt} ${checked ? "line-through" : ""}`}>{s.text}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function RoutinesView({ routines, routineLogs, dark, onSave, onDelete, onToggleStep }) {
+  const [selectedId, setSelectedId] = useState(null);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [confirmDel, setConfirmDel] = useState(null);
+
+  const txt = dark ? "text-white" : "text-gray-900";
+  const sub = dark ? "text-gray-400" : "text-gray-500";
+  const card = dark ? "bg-gray-800 border-gray-700" : "bg-white border-gray-100";
+
+  const todayKey = toKey(new Date());
+  const doneToday = (routineId) => new Set((routineLogs?.[routineId]?.[todayKey]) || []);
+
+  const handleSave = (r) => { onSave(r); setModalOpen(false); setEditing(null); };
+
+  const modalAndConfirm = (
+    <>
+      <RoutineModal open={modalOpen} editing={editing} dark={dark}
+        onClose={() => { setModalOpen(false); setEditing(null); }} onSave={handleSave} />
+      <ConfirmDialog open={!!confirmDel} dark={dark} title="Eliminar rutina"
+        message={`¿Eliminar "${confirmDel?.name}"? Se perderá su historial.`}
+        onConfirm={() => { onDelete(confirmDel.id); setConfirmDel(null); setSelectedId(null); }}
+        onCancel={() => setConfirmDel(null)} />
+    </>
+  );
+
+  const selected = routines.find((r) => r.id === selectedId);
+  if (selected) {
+    return (
+      <>
+        <RoutineDetail routine={selected} done={doneToday(selected.id)} dark={dark}
+          onBack={() => setSelectedId(null)} onToggleStep={onToggleStep}
+          onEdit={() => { setEditing(selected); setModalOpen(true); }}
+          onDelete={() => setConfirmDel(selected)} />
+        {modalAndConfirm}
+      </>
+    );
+  }
+
+  return (
+    <div className="px-4 pb-4 space-y-4 relative">
+      <button onClick={() => { setEditing(null); setModalOpen(true); }}
+        className="w-full flex items-center justify-center gap-2 py-2.5 rounded-2xl font-semibold text-white bg-blue-500 hover:bg-blue-600 transition active:scale-95">
+        <Plus size={18} /> Nueva rutina
+      </button>
+
+      {ROUTINE_TIMES.map((tf) => {
+        const list = routines.filter((r) => (r.timeOfDay || "na") === tf.id);
+        if (list.length === 0) return null;
+        const TfIcon = tf.icon;
+        return (
+          <div key={tf.id}>
+            <h3 className="text-sm font-bold mb-2 flex items-center gap-2" style={{ color: tf.color }}>
+              <TfIcon size={16} /> {tf.name}
+            </h3>
+            <div className="space-y-2">
+              {list.map((r) => {
+                const steps = r.steps || [];
+                const done = doneToday(r.id);
+                const doneCount = steps.filter((s) => done.has(s.id)).length;
+                const pct = steps.length ? Math.round((doneCount / steps.length) * 100) : 0;
+                const allDone = steps.length > 0 && doneCount === steps.length;
+                return (
+                  <div key={r.id} className={`relative overflow-hidden rounded-2xl border ${card}`}>
+                    <span className="absolute left-0 top-0 bottom-0 w-1" style={{ background: tf.color }} />
+                    <div className="flex items-stretch">
+                      <button onClick={() => setSelectedId(r.id)} className="flex-1 min-w-0 text-left p-4">
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div className="flex items-center justify-center rounded-xl shrink-0 text-2xl"
+                            style={{ width: 44, height: 44, background: `${tf.color}1a` }}>
+                            {r.emoji || "🧖"}
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <p className={`font-semibold truncate ${txt}`}>{r.name}</p>
+                            <p className={`text-xs mt-0.5 ${allDone ? "" : sub}`} style={allDone ? { color: "#10b981" } : undefined}>
+                              {steps.length === 0 ? "Sin pasos · toca para añadir" : allDone ? "✓ Completada hoy" : `${doneCount}/${steps.length} pasos hoy`}
+                            </p>
+                            {steps.length > 0 && (
+                              <div className={`mt-2 h-1.5 rounded-full overflow-hidden ${dark ? "bg-gray-700" : "bg-gray-100"}`}>
+                                <div className="h-full rounded-full transition-all duration-500" style={{ width: `${pct}%`, background: tf.color }} />
+                              </div>
+                            )}
+                          </div>
+                          <ChevronRight size={20} className={`shrink-0 ${dark ? "text-gray-600" : "text-gray-300"}`} />
+                        </div>
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+
+      {routines.length === 0 && (
+        <div className={`text-center py-16 ${sub}`}>
+          <ListChecks size={48} className="mx-auto mb-3 opacity-50" />
+          <p className="font-medium">Aún no tienes rutinas</p>
+          <p className="text-sm">Toca "Nueva rutina" para crear la primera</p>
+        </div>
+      )}
+
+      {modalAndConfirm}
+    </div>
+  );
+}
+
 // ----------------------------- Main App ------------------------------------
 
 export default function App() {
@@ -2260,6 +2616,8 @@ export default function App() {
   const tasks = data?.tasks ?? [];
   const events = data?.events ?? [];
   const goals = data?.goals ?? [];
+  const routines = data?.routines ?? [];
+  const routineLogs = data?.routineLogs ?? {};
 
   const createAccount = async (name, pin) => {
     const id = "acc" + Date.now();
@@ -2425,6 +2783,36 @@ export default function App() {
     update((d) => ({ ...d, goals: (d.goals || []).filter((g) => g.id !== id) }));
   };
 
+  // ---- Routine actions ----
+  const handleSaveRoutine = (routine) => {
+    update((d) => {
+      const rs = d.routines || [];
+      if (routine.id && rs.some((r) => r.id === routine.id)) {
+        return { ...d, routines: rs.map((r) => (r.id === routine.id ? routine : r)) };
+      }
+      return { ...d, routines: [...rs, { ...routine, id: "r" + Date.now(), steps: routine.steps || [], createdAt: Date.now() }] };
+    });
+  };
+  const handleDeleteRoutine = (id) => {
+    update((d) => {
+      const rl = { ...(d.routineLogs || {}) };
+      delete rl[id];
+      return { ...d, routines: (d.routines || []).filter((r) => r.id !== id), routineLogs: rl };
+    });
+  };
+  const handleToggleRoutineStep = (routineId, stepId) => {
+    const k = toKey(new Date());
+    update((d) => {
+      const rl = { ...(d.routineLogs || {}) };
+      const forRoutine = { ...(rl[routineId] || {}) };
+      const todaySet = new Set(forRoutine[k] || []);
+      if (todaySet.has(stepId)) todaySet.delete(stepId); else todaySet.add(stepId);
+      forRoutine[k] = Array.from(todaySet);
+      rl[routineId] = forRoutine;
+      return { ...d, routineLogs: rl };
+    });
+  };
+
   if (loading || accounts === null) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
@@ -2473,6 +2861,7 @@ export default function App() {
 
   const tabs = [
     { id: "today", name: "Hoy", icon: Home },
+    { id: "rutinas", name: "Rutinas", icon: ListChecks },
     { id: "metas", name: "Metas", icon: Flag },
     { id: "tasks", name: "Tareas", icon: ListTodo },
     { id: "tracker", name: "Tracker", icon: LayoutGrid },
@@ -2480,7 +2869,7 @@ export default function App() {
     { id: "stats", name: "Stats", icon: BarChart3 },
     { id: "settings", name: "Ajustes", icon: Settings },
   ];
-  const titles = { today: "Hoy", metas: "Metas", tasks: "Tareas", tracker: "Tracker", calendar: "Calendario", stats: "Estadísticas", settings: "Ajustes" };
+  const titles = { today: "Hoy", rutinas: "Rutinas", metas: "Metas", tasks: "Tareas", tracker: "Tracker", calendar: "Calendario", stats: "Estadísticas", settings: "Ajustes" };
 
   return (
     <div className={`${bg} min-h-screen transition-colors duration-300`} style={{ fontFamily: "system-ui, -apple-system, sans-serif" }}>
@@ -2542,6 +2931,10 @@ export default function App() {
           )}
           {tab === "metas" && (
             <GoalsView goals={goals} dark={dark} onSave={handleSaveGoal} onDelete={handleDeleteGoal} />
+          )}
+          {tab === "rutinas" && (
+            <RoutinesView routines={routines} routineLogs={routineLogs} dark={dark}
+              onSave={handleSaveRoutine} onDelete={handleDeleteRoutine} onToggleStep={handleToggleRoutineStep} />
           )}
           {tab === "tasks" && (
             <TasksView tasks={tasks} dark={dark}
